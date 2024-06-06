@@ -1,11 +1,31 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import { randomUUID } from 'crypto';
 import bcrypt from 'bcrypt';
-import mysql from 'mysql';
+import mysql from 'mysql2';
 import dotenv from 'dotenv';
+import winston from 'winston';
 
-// Load env variable
+// Load env variables
 dotenv.config();
+
+// Logger configuration
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.timestamp(),
+        winston.format.printf(({ timestamp, level, message }) => `${timestamp} [${level}]: ${message}`)
+    ),
+    transports: [
+        new winston.transports.Console()
+    ]
+});
+
+// Ensure environment variables are loaded
+if (!process.env.DB_HOST || !process.env.DB_USER || !process.env.DB_PASSWORD || !process.env.DB_NAME) {
+    logger.error('One or more environment variables are missing. Please check your .env file.');
+    process.exit(1);
+}
 
 // MySQL connection
 const db = mysql.createConnection({
@@ -17,59 +37,60 @@ const db = mysql.createConnection({
 
 db.connect((err) => {
     if (err) {
-        console.error('Error connecting to MySQL: ', err);
+        logger.error('Error connecting to MySQL: ', err);
         return;
     }
-    console.log('Connected to MySQL');
+    logger.info('Connected to MySQL');
 });
 
-const clients = new Map(); // has to be a Map instead of {} due to non-string keys
-const wss = new WebSocketServer({ port: 8080 }); // initiate a new server that listens on port 8080
+const clients = new Map(); // Use Map to track clients
+const wss = new WebSocketServer({ port: 8080 }); // WebSocket server on port 8080
 
-// set up event handlers and do other things upon a client connecting to the server
+// Event handler for new connections
 wss.on('connection', (ws) => {
-    // create an id to track the client
     const id = randomUUID();
     clients.set(ws, id);
-    console.log(`new connection assigned id: ${id}`);
+    logger.info(`New connection assigned id: ${id}`);
 
-    // send a message to all connected clients upon receiving a message from one of the connected clients
+    // Message handler
     ws.on('message', async (data) => {
-        const message = JSON.parse(data);
+        try {
+            const message = JSON.parse(data);
 
-        if(message.type === 'login') {
-            const { username, password } = message;
-            const user = await getUserByUsername(username);
+            if (message.type === 'login') {
+                const { username, password } = message;
+                const user = await getUserByUsername(username);
 
-            if (user && await bcrypt.compare(password, user.password_hash)) {
-                ws.send(JSON.stringify({ type: 'login_success', id, username}));
+                if (user && await bcrypt.compare(password, user.password_hash)) {
+                    ws.send(JSON.stringify({ type: 'login_success', id, username }));
+                } else {
+                    ws.send(JSON.stringify({ type: 'login_failure' }));
+                }
             } else {
-                ws.send(JSON.stringify({ type: 'login_failure' }));
+                serverBroadcast(`Client ${clients.get(ws)}: ${data}`);
             }
-        } else {
-            serverBroadcast('Client ${clients.get(ws)} ${data}');
+        } catch (error) {
+            logger.error('Error handling message:', error);
         }
-
-        
     });
 
-    // stop tracking the client upon that client closing the connection
+    // Close handler
     ws.on('close', () => {
-        console.log(`connection (id = ${clients.get(ws)}) closed`);
+        logger.info(`Connection (id = ${clients.get(ws)}) closed`);
         clients.delete(ws);
     });
 
-    // send the id back to the newly connected client
-    ws.send(JSON.stringify({ type: 'assign_id', id}));
+    // Assign id to the newly connected client
+    ws.send(JSON.stringify({ type: 'assign_id', id }));
 });
 
-// send a message to all the connected clients about how many of them there are every 15 seconds
+// Broadcast message every 15 seconds
 setInterval(() => {
-    console.log(`Number of connected clients: ${clients.size}`);
+    logger.info(`Number of connected clients: ${clients.size}`);
     serverBroadcast(`Number of connected clients: ${clients.size}`);
 }, 15000);
 
-// function for sending a message to every connected client
+// Function for broadcasting messages to all clients
 function serverBroadcast(message) {
     wss.clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) {
@@ -78,11 +99,12 @@ function serverBroadcast(message) {
     });
 }
 
+// Function to fetch user by username
 async function getUserByUsername(username) {
     return new Promise((resolve, reject) => {
         db.query('SELECT * FROM users WHERE username = ?', [username], (err, results) => {
             if (err) {
-                console.error('Error fetching user:', err);
+                logger.error('Error fetching user:', err);
                 return reject(err);
             }
             resolve(results[0]);
@@ -90,5 +112,4 @@ async function getUserByUsername(username) {
     });
 }
 
-
-console.log('The server is running and waiting for connections');
+logger.info('The server is running and waiting for connections');
