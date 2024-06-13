@@ -4,6 +4,8 @@ import bcrypt from 'bcrypt';
 import mysql from 'mysql2';
 import dotenv from 'dotenv';
 import winston from 'winston';
+import jwt from 'jsonwebtoken';
+import { userInfo } from 'os';
 
 // Load env variables
 dotenv.config();
@@ -22,7 +24,7 @@ const logger = winston.createLogger({
 });
 
 // Ensure environment variables are loaded
-if (!process.env.DB_HOST || !process.env.DB_USER || !process.env.DB_PASSWORD || !process.env.DB_NAME) {
+if (!process.env.DB_HOST || !process.env.DB_USER || !process.env.DB_PASSWORD || !process.env.DB_NAME || !process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
     logger.error('One or more environment variables are missing. Please check your .env file.');
     process.exit(1);
 }
@@ -62,9 +64,25 @@ wss.on('connection', (ws) => {
                 const user = await getUserByUsername(username);
 
                 if (user && await bcrypt.compare(password, user.password_hash)) {
-                    ws.send(JSON.stringify({ type: 'login_success', id, username }));
+                    const token = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRATION });
+                    const refreshToken = jwt.sign({ id: user.id, username: user.username }, process.env.REFRESH_TOKEN_SECRET, { expiresIn: process.env.REFRESH_TOKEN_EXPIRATION });
+
+                    // Save refresh tokens to database (implement saveRefreshToken func)
+                    await saveRefreshToken(user.id, refreshToken);
+
+                    ws.send(JSON.stringify({ type: 'login_success', token, refreshToken }));
                 } else {
                     ws.send(JSON.stringify({ type: 'login_failure' }));
+                }
+            } else if (message.type === 'refresh_token') {
+                const { refreshToken } = message;
+                try {
+                    const payload = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
+                    const newToken = jwt.sign({ id: payload.id, username: payload.username }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRATION });
+
+                    ws.send(JSON.stringify({ type: 'refresh_success', token: newToken }));
+                } catch (err) {
+                    ws.send(JSON.stringify({ type: 'refresh_failure' }));
                 }
             } else {
                 serverBroadcast(`Client ${clients.get(ws)}: ${data}`);
@@ -111,5 +129,19 @@ async function getUserByUsername(username) {
         });
     });
 }
+
+// Function to save refresh token in the database
+async function saveRefreshToken(userId, refreshToken) {
+    return new Promise((resolve, reject) => {
+        db.query('UPDATE users SET refresh_token = ? WHERE id = ?', [refreshToken, userId], (err, results) => {
+            if (err) {
+                logger.error('Error saving refresh token: ', err);
+                return reject(err);
+            }
+            resolve(results);
+        });
+    });
+}
+
 
 logger.info('The server is running and waiting for connections');
